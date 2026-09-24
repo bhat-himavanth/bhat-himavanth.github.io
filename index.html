@@ -774,18 +774,18 @@ const PROJECTS = [
     title: 'OWASP-Based REST API Security Assessment System',
     period: 'Jan 2026 – Apr 2026',
     status: 'completed',
-    summary: 'An OWASP-aligned system that automates detection of critical API vulnerabilities. A modular Python testing workflow simulates real-world attacks and reports what it finds as structured vulnerability insights, to help teams validate API security automatically.',
-    checks: ['Authentication flaws', 'Authorization weaknesses (BOLA)', 'Sensitive data exposure'],
-    tags: ['Python', 'OWASP API Security', 'REST', 'BOLA', 'Attack simulation'],
+    summary: 'A Python-based scanner that captures real API traffic through Burp Suite to learn an application\u2019s authentication and request structure. It then replays those requests with controlled mutations, testing for the critical OWASP API vulnerabilities below. Built and validated against OWASP Juice Shop running in Docker, a safe target designed to be broken, with the eventual goal of testing other authorized REST APIs.',
+    checks: ['Broken Authentication: tokens stripped, replaced and modified', 'BOLA: object identifiers manipulated to test authorization', 'Excessive Data Exposure: responses scanned for unnecessary fields'],
+    tags: ['Python', 'Burp Suite', 'OWASP API Security', 'REST', 'Docker'],
   },
   {
     id: 'cvss-ml',
     title: 'Predicting CVSS Severity Scores with ML and NLP',
     period: 'Aug 2025 – Nov 2025',
     status: 'completed',
-    summary: 'A BERT-based NLP system that predicts CVSS severity levels and base scores straight from vulnerability descriptions. It includes both a classification model and a regression model, built with Hugging Face Transformers and trained on Kaggle GPUs.',
-    flow: ['Vulnerability description', 'BERT', 'Severity level + base score'],
-    tags: ['BERT', 'Hugging Face', 'Classification', 'Regression', 'Kaggle GPU'],
+    summary: 'A BERT-based system that automates the first pass of vulnerability assessment. It\u2019s trained on cleaned NVD/CVE data using only the vulnerability description as input, never the CVSS metrics themselves, so it can\u2019t simply memorize the answer. Two independent heads share the fine-tuned encoder: a classification head for severity (None through Critical) and a regression head for the 0\u201310 base score, built to help vulnerability management teams triage large backlogs faster. It supports an analyst\u2019s initial read rather than replacing one; the model never sees asset criticality, exploit availability or environmental context.',
+    flow: ['Vulnerability description', 'BERT tokenizer', 'Fine-tuned BERT', 'Classification + regression heads', 'Severity + base score'],
+    tags: ['BERT', 'NVD/CVE dataset', 'Classification', 'Regression', 'NLP'],
   },
 ];
 
@@ -1034,6 +1034,8 @@ function renderProjects() {
         ${project.flow ? `<ol class="flow" aria-label="How it works">${project.flow.map(step => `<li>${esc(step)}</li>`).join('')}</ol>` : ''}
         <ul class="tags">${project.tags.map(t => `<li>${esc(t)}</li>`).join('')}</ul>
         ${project.id === 'orchestrator' ? '<div class="lab" id="lab"></div>' : ''}
+        ${project.id === 'api-security' ? '<div class="lab" id="lab-api"></div>' : ''}
+        ${project.id === 'cvss-ml' ? '<div class="lab" id="lab-cvss"></div>' : ''}
       </div>
     </article>`).join('');
 }
@@ -1168,6 +1170,175 @@ const SCENARIOS = [
 
 // Made-up traffic mix for the stream demo: how often the deeper AI pass is actually needed.
 const STREAM_MIX = { needsDeepPass: 0.18 };
+
+/* =====================================================================
+   API security scanner lab \u2014 mirrors the real capture \u2192 mutate \u2192 replay
+   \u2192 analyze workflow, run against OWASP Juice Shop as the controlled
+   target. Findings below are illustrative of the workflow, not a live scan.
+   ===================================================================== */
+
+const API_TESTS = [
+  { label: 'Broken Authentication',
+    steps: [
+      'Replaying the request captured from Burp Suite, token intact \u2014 baseline 200 OK',
+      'Stripping the Authorization header and replaying the same request',
+      'Swapping in a malformed, expired token and replaying again',
+      'Diffing both responses against the authenticated baseline',
+    ],
+    verdict: { ok: false, text: 'Both the stripped and malformed tokens still returned 200 \u2014 this route isn\u2019t enforcing authentication.' } },
+  { label: 'BOLA',
+    steps: [
+      'Capturing a request for an object owned by the authenticated account',
+      'Substituting the object identifier with one belonging to a different account',
+      'Replaying the request with the substituted identifier',
+      'Checking whether the response contains that other account\u2019s data',
+    ],
+    verdict: { ok: false, text: 'The substituted identifier returned another account\u2019s data \u2014 object-level authorization isn\u2019t checked.' } },
+  { label: 'Excessive Data Exposure',
+    steps: [
+      'Capturing the raw JSON response for this endpoint',
+      'Diffing returned fields against what the client actually renders',
+      'Matching remaining fields against sensitive-field patterns',
+    ],
+    verdict: { ok: false, text: 'The response includes fields the client never renders, including one that looks like a password hash.' } },
+];
+
+function mountApiSecurityLab() {
+  const lab = $('#lab-api');
+  if (!lab) return;
+
+  lab.innerHTML = `
+    <div class="term">
+      <div class="term-bar">
+        <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="term-title">scanner: juice-shop</span>
+      </div>
+      <div class="term-body">
+        <p class="lab-note">Traffic is captured once via Burp Suite, then the scanner replays it with controlled mutations. Run against OWASP Juice Shop, an intentionally vulnerable app used as a safe target \u2014 the findings below illustrate the workflow.</p>
+        <div class="lab-buttons" id="api-buttons"></div>
+        <div id="api-log"></div>
+        <p class="lab-readout" id="api-readout" aria-live="polite">Pick a test to run it against the captured traffic.</p>
+      </div>
+    </div>`;
+
+  const buttonRow = $('#api-buttons');
+  const log = $('#api-log');
+  const readout = $('#api-readout');
+  const pause = prefersReducedMotion ? 40 : 550;
+
+  buttonRow.innerHTML = API_TESTS
+    .map((t, i) => `<button class="lab-btn" type="button" data-test="${i}">${esc(t.label)}</button>`)
+    .join('');
+
+  function setBusy(isBusy) { buttonRow.querySelectorAll('button').forEach(b => { b.disabled = isBusy; }); }
+
+  async function runTest(test) {
+    setBusy(true);
+    log.innerHTML = '';
+    readout.textContent = `Testing: ${test.label}`;
+
+    for (const step of test.steps) {
+      const line = document.createElement('div');
+      line.className = 't-line';
+      line.innerHTML = `${paint.dim('$')} ${esc(step)}`;
+      log.appendChild(line);
+      await sleep(pause);
+    }
+
+    readout.innerHTML = `${test.verdict.ok ? paint.green('Protected.') : paint.red('Vulnerable.')} ${esc(test.verdict.text)}`;
+    setBusy(false);
+  }
+
+  buttonRow.addEventListener('click', event => {
+    const button = event.target.closest('button');
+    if (!button || button.disabled) return;
+    runTest(API_TESTS[Number(button.dataset.test)]);
+  });
+}
+
+/* =====================================================================
+   CVSS predictor lab \u2014 mirrors the real inference pipeline: a vulnerability
+   description goes through the BERT tokenizer, then a classification head
+   (severity) and a regression head (base score). Sample descriptions and
+   scores below are illustrative, not live model output.
+   ===================================================================== */
+
+const CVSS_SAMPLES = [
+  { label: 'Remote code execution',
+    text: 'A remote attacker can execute arbitrary code via a crafted request that triggers a buffer overflow in the parsing routine.',
+    severity: 'Critical', score: 9.8 },
+  { label: 'Broken access control',
+    text: 'An authenticated user can view another user\u2019s non-sensitive profile information due to insufficient access control.',
+    severity: 'Medium', score: 5.3 },
+  { label: 'Missing rate limit',
+    text: 'The login endpoint does not enforce a rate limit, allowing repeated authentication attempts from a single source.',
+    severity: 'Low', score: 3.1 },
+];
+
+const SEVERITY_COLOR = { Critical: 'red', High: 'amber', Medium: 'amber', Low: 'green', None: 'dim' };
+
+function mountCvssLab() {
+  const lab = $('#lab-cvss');
+  if (!lab) return;
+
+  lab.innerHTML = `
+    <div class="term">
+      <div class="term-bar">
+        <span class="term-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span class="term-title">cvss-predictor: inference</span>
+      </div>
+      <div class="term-body">
+        <p class="lab-note">Pick a sample description to see it move through the real pipeline: tokenizer \u2192 fine-tuned BERT \u2192 classification head + regression head. Scores here are illustrative, not live model output.</p>
+        <div class="lab-buttons" id="cvss-buttons"></div>
+        <div id="cvss-log"></div>
+        <p class="lab-readout" id="cvss-readout" aria-live="polite">Pick a description to run inference on it.</p>
+      </div>
+    </div>`;
+
+  const buttonRow = $('#cvss-buttons');
+  const log = $('#cvss-log');
+  const readout = $('#cvss-readout');
+  const pause = prefersReducedMotion ? 40 : 500;
+
+  buttonRow.innerHTML = CVSS_SAMPLES
+    .map((s, i) => `<button class="lab-btn" type="button" data-sample="${i}">${esc(s.label)}</button>`)
+    .join('');
+
+  function setBusy(isBusy) { buttonRow.querySelectorAll('button').forEach(b => { b.disabled = isBusy; }); }
+
+  async function runInference(sample) {
+    setBusy(true);
+    log.innerHTML = '';
+    readout.textContent = 'Running inference...';
+
+    const steps = [
+      `Input: "${sample.text}"`,
+      'Tokenizing with the BERT tokenizer',
+      'Encoding through the fine-tuned BERT model',
+      'Classification head estimating severity category',
+      'Regression head estimating the numerical base score',
+    ];
+    for (const step of steps) {
+      const line = document.createElement('div');
+      line.className = 't-line';
+      line.innerHTML = `${paint.dim('$')} ${esc(step)}`;
+      log.appendChild(line);
+      await sleep(pause);
+    }
+
+    const color = SEVERITY_COLOR[sample.severity] || 'dim';
+    readout.innerHTML =
+      `Severity: ${paint[color](sample.severity)} &middot; Base score: ${paint.bold(sample.score.toFixed(1))} / 10 ` +
+      paint.dim('\u2014 an analyst still confirms this; the model only sees the description text.');
+    setBusy(false);
+  }
+
+  buttonRow.addEventListener('click', event => {
+    const button = event.target.closest('button');
+    if (!button || button.disabled) return;
+    runInference(CVSS_SAMPLES[Number(button.dataset.sample)]);
+  });
+}
 
 function mountEscalationLab() {
   const lab = $('#lab');
@@ -1625,6 +1796,8 @@ setupSkillFilters();
 renderExperience();
 renderProjects();
 mountEscalationLab();
+mountApiSecurityLab();
+mountCvssLab();
 renderCredentials();
 renderContact();
 setupChrome();
